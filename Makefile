@@ -1,7 +1,7 @@
 CC = gcc
 CFLAGS = -Wall -fPIC -I/usr/include/security
 LDFLAGS = -shared -lpam -lssl -lcrypto
-TARGET = build/pam_auth_module.so
+TARGET = build/custom_pam_auth.so
 
 SOURCES = custom_pam_auth.c
 OBJECTS = $(SOURCES:%.c=build/%.o)
