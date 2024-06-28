@@ -6,11 +6,10 @@
 #include <pwd.h>
 #include <ctype.h>
 #include <openssl/evp.h>
-#include <openssl/sha.h>
-#include <openssl/md5.h>
 #include <security/pam_appl.h>
 #include <security/pam_modules.h>
 #include <security/pam_ext.h>
+#include <unistd.h>
 
 #define HASH_TYPE_SHA256 "sha256"
 #define HASH_TYPE_SHA512 "sha512"
@@ -20,13 +19,14 @@
 #define HASH_TYPE_PAM "pam"
 #define HASH_TYPE_PAM_UNIX "unix"
 
-#define DEFAULT_HASHTYPE HASH_TYPE_SHA256
-#define DEFAULT_CONFIG_FILENAME ".custom-auth"
 #define CONF_HASHTYPE "hashtype"
 #define CONF_PASSWORD "password"
 #define CONF_ENABLED "enabled"
 
-const char *get_param_value(int argc, const char **argv, const char *param)
+#define DEFAULT_HASHTYPE HASH_TYPE_SHA256
+#define DEFAULT_CONFIG_FILENAME ".custom-auth"
+
+const char *get_param(int argc, const char **argv, const char *param)
 {
   for (int i = 0; i < argc; ++i)
   {
@@ -38,7 +38,7 @@ const char *get_param_value(int argc, const char **argv, const char *param)
   return NULL;
 }
 
-void trim_whitespace(char *str)
+void trim(char *str)
 {
   char *end;
 
@@ -62,17 +62,15 @@ void trim_whitespace(char *str)
   end[1] = '\0';
 }
 
-int read_config(const char *filename, char *hash_type, char *stored_hash, int *enabled)
+int read_conf(const char *filename, char *hash_type, char *stored_hash, int *enabled)
 {
   FILE *file = fopen(filename, "r");
-
   if (!file)
   {
     return -1;
   }
 
   char line[256];
-
   while (fgets(line, sizeof(line), file))
   {
     char *comment = strchr(line, '#');
@@ -82,7 +80,7 @@ int read_config(const char *filename, char *hash_type, char *stored_hash, int *e
       *comment = '\0';
     }
 
-    trim_whitespace(line);
+    trim(line);
 
     if (strlen(line) == 0)
     {
@@ -123,7 +121,7 @@ int read_config(const char *filename, char *hash_type, char *stored_hash, int *e
   return 0;
 }
 
-int is_valid_hash_type(const char *hash_type)
+int check_hashtype(const char *hash_type)
 {
   const char *valid_hash_types[] = {HASH_TYPE_SHA256, HASH_TYPE_SHA512, HASH_TYPE_MD5, HASH_TYPE_PLAIN, HASH_TYPE_TEXT, HASH_TYPE_PAM, HASH_TYPE_PAM_UNIX, NULL};
 
@@ -150,7 +148,7 @@ void check_hash(const char *str, const char *hash_type, char *output_buffer)
 
   if (mdctx == NULL)
   {
-    syslog(LOG_ERR, "Failed to create EVP_MD_CTX");
+    syslog(LOG_ERR, "Can not create EVP_MD_CTX");
     return;
   }
 
@@ -210,6 +208,28 @@ int pam_authenticate_with_pam_unix(const char *user, const char *password)
   return retval;
 }
 
+int converse(pam_handle_t *pamh, int nargs, const struct pam_message **message, struct pam_response **response)
+{
+  int retval;
+  struct pam_conv *conv;
+
+  retval = pam_get_item(pamh, PAM_CONV, (const void **)&conv);
+  if (retval != PAM_SUCCESS)
+  {
+    return retval;
+  }
+
+  return conv->conv(nargs, message, response, conv->appdata_ptr);
+}
+
+/**
+ * USAGE:
+ *
+ * auth    required    pam_auth_module.so filename=config hashtype=sha256
+ * ... account required    pam_unix.so
+ * ... auth    required    pam_unix.so
+ */
+
 PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, const char **argv)
 {
   const char *user;
@@ -225,9 +245,13 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
 
   pam_get_item(pamh, PAM_USER, (const void **)&user);
 
-  config_file = get_param_value(argc, argv, "filename=");
-  
+  config_file = get_param(argc, argv, "filename=");
+
   if (!config_file)
+  {
+    snprintf(config_path, sizeof(config_path), "%s/%s", getpwuid(getuid())->pw_dir, DEFAULT_CONFIG_FILENAME);
+  }
+  else
   {
     struct passwd *pw = getpwnam(user);
 
@@ -235,25 +259,22 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
     {
       return PAM_AUTH_ERR;
     }
-
-    snprintf(config_path, sizeof(config_path), "%s/%s", pw->pw_dir, DEFAULT_CONFIG_FILENAME);
-
-    config_file = config_path;
+    snprintf(config_path, sizeof(config_path), "%s/%s", pw->pw_dir, config_file);
   }
 
-  if (read_config(config_file, hash_type, stored_hash, &enabled) != 0 || !enabled)
+  if (read_conf(config_path, hash_type, stored_hash, &enabled) != 0 || !enabled)
   {
     return PAM_AUTH_ERR;
   }
 
-  const char *param_hash_type = get_param_value(argc, argv, "hashtype=");
+  const char *param_hash_type = get_param(argc, argv, "hashtype=");
 
-  if (param_hash_type && is_valid_hash_type(param_hash_type))
+  if (param_hash_type && check_hashtype(param_hash_type))
   {
     strncpy(hash_type, param_hash_type, sizeof(hash_type) - 1);
     hash_type[sizeof(hash_type) - 1] = '\0';
   }
-  else if (!is_valid_hash_type(hash_type))
+  else if (!check_hashtype(hash_type))
   {
     strcpy(hash_type, DEFAULT_HASHTYPE);
   }
@@ -261,7 +282,7 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
   struct pam_message msg = {.msg_style = PAM_PROMPT_ECHO_OFF, .msg = "Password: "};
   const struct pam_message *msgp = &msg;
   struct pam_response *resp = NULL;
-  
+
   int ret = converse(pamh, 1, &msgp, &resp);
 
   if (ret != PAM_SUCCESS || resp == NULL)
@@ -282,9 +303,10 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
     return retval == PAM_SUCCESS ? PAM_SUCCESS : PAM_AUTH_ERR;
   }
 
-  compute_hash(password, hash_type, input_hash);
+  check_hash(password, hash_type, input_hash);
 
   memset(resp->resp, 0, strlen(resp->resp));
+  
   free(resp->resp);
   free(resp);
 
